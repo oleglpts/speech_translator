@@ -1,9 +1,13 @@
 #!/usr/bin/env python
 
+import math
 import wave
 import gtts
+import struct
 import pyaudio
+import threading
 import speech_recognition as sr
+import speech_recognition.exceptions
 from playsound import playsound
 from deep_translator import GoogleTranslator
 
@@ -15,7 +19,9 @@ Simple translator using Google services
 
 
 class Translator:
-    def __init__(self, chunk: int = 1024, audio_format=pyaudio.paInt16, channel: int = 1, rate: int = 44100):
+    def __init__(self, chunk: int = 1024, audio_format=pyaudio.paInt16, channel: int = 1, pause: int = 2,
+                 rate: int = 44100, normalize: float = (1.0/32768.0), noise: float = 0.04521571580107228,
+                 debug: bool = False):
         """
 
         Constructor
@@ -26,15 +32,25 @@ class Translator:
         :type audio_format: int
         :param channel: alsa channel
         :type channel: int
+        :param pause: pause in sec (start translate)
+        :type pause: int
         :param rate: audio rate
         :type rate: int
+        :param debug: debug
+        :type debug: bool
+        :param normalize: normalization
+        :type normalize: float
         """
         self._chunk = chunk
         self._format = audio_format
         self._channel = channel
         self._sample_rate = rate
+        self._normalize = normalize
+        self._noise = noise
+        self._pause = pause
+        self._debug = debug
 
-    def record_file(self, file_name: str = 'recorded.wav', record_seconds: int = 5):
+    def record_file(self, file_name: str = 'recorded.wav', record_seconds: int = 5) -> bool:
         """
 
         Record form microphone to file
@@ -43,16 +59,36 @@ class Translator:
         :type file_name: str
         :param record_seconds: record time in seconds
         :type record_seconds: int
+        :return True if recorded data
+        :rtype: bool
         """
         p = pyaudio.PyAudio()
         stream = p.open(format=self._format, channels=self._channel, rate=self._sample_rate,
                         input=True, output=True, frames_per_buffer=self._chunk)
         frames = []
-        print("Recording...")
-        for i in range(int(44100 / self._chunk * record_seconds)):
+        recorded = False
+        empty_counter = 0
+        max_wakeup_amplitude = 0.0
+        for i in range(int(self._sample_rate / self._chunk * record_seconds)):
             data = stream.read(self._chunk)
+            amplitude = self.get_amplitude(data)
+            if amplitude < self._noise:
+                empty_counter += 1
+                if not recorded and empty_counter == 1 and self._debug:
+                    print('Speak, please...')
+            else:
+                empty_counter = 0
+                recorded = True
+                if self._debug:
+                    print(f'Wake amplitude {amplitude}')
+                if amplitude > max_wakeup_amplitude:
+                    max_wakeup_amplitude = amplitude
+            if empty_counter >= int(self._sample_rate / self._chunk * self._pause):
+                break
             frames.append(data)
-        print("Finished recording.")
+        if self._debug:
+            print("Finished recording.")
+            print(f'Max wakeup amplitude {max_wakeup_amplitude}')
         stream.stop_stream()
         stream.close()
         p.terminate()
@@ -62,6 +98,54 @@ class Translator:
         wf.setframerate(self._sample_rate)
         wf.writeframes(b"".join(frames))
         wf.close()
+        return recorded
+
+    def get_amplitude(self, block):
+        """
+
+        Get block amplitude
+
+        :param block: data
+        :type block: bytes
+        :return: amplitude
+        :rtype: float
+        """
+        count = len(block) / 2
+        shorts = struct.unpack("%dh" % count, block)
+        sum_squares = 0.0
+        for sample in shorts:
+            n = sample * self._normalize
+            sum_squares += n * n
+        return math.sqrt(sum_squares / count)
+
+    def translate(self, source_file: str = 'recorded.wav', target_file: str = 'translated.mp3',
+                  source: str = 'ru', target='en'):
+        """
+
+        Translate file
+
+        :param source_file: source file
+        :param target_file: translated file
+        :param source: source language
+        :param target: target language
+        """
+        try:
+            recognized = self.recognize_file(source_file, source)
+            if self._debug:
+                print(f'Recognized: \'{recognized}\'')
+                print('Translating...')
+            translated = self.translate_text(recognized, target=target)
+            if self._debug:
+                print(f'Translated: \'{translated}\'')
+                print('Saving translated to audio file...')
+            self.text_to_file(translated, file_name=target_file, language=target)
+            if self._debug:
+                print('Saved')
+                print('Playing saved...')
+            self.play_file('translated.mp3')
+        except speech_recognition.exceptions.UnknownValueError:
+            if self._debug:
+                print('Silence')
 
     @staticmethod
     def play_file(file_name: str = 'recorded.wav'):
@@ -135,23 +219,10 @@ Test (from command line: ./main.py 2>/dev/null)
 """
 
 if __name__ == '__main__':
-    seconds = 10
-    print('Started')
+    seconds = 3600
     translator = Translator()
-    print(f'Recording {seconds} seconds...')
-    translator.record_file(record_seconds=seconds)
-    print('Recorded')
-    print('Playing recorded...')
-    translator.play_file()
-    print('Recognizing...')
-    recognized = translator.recognize_file()
-    print(f'Recognized: \'{recognized}\'')
-    print('Translating...')
-    translated = translator.translate_text(recognized)
-    print(f'Translated: \'{translated}\'')
-    print('Saving translated to audio file...')
-    translator.text_to_file(translated)
-    print('Saved')
-    print('Playing saved...')
-    translator.play_file('translated.mp3')
-    print('Finished')
+    while True:
+        if translator.record_file(record_seconds=seconds):
+            t = threading.Thread(target=translator.translate)
+            t.daemon = False
+            t.start()
