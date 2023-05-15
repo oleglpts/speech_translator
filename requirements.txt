@@ -1,0 +1,8 @@
+SpeechRecognition
+pyttsx3
+gTTS
+playsound
+deep_translator
+pyalsaaudio
+pyaudio
+pygobject
